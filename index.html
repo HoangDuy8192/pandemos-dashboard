@@ -116,7 +116,7 @@ tbody tr:last-child td{border-bottom:none}
 </div>
 
 <div class="info-bar">
-  💡 <strong>Cách dùng:</strong> Nhân sự phụ trách export CSV từ hệ thống → upload vào đây → dashboard tự cập nhật cho toàn team
+  💡 <strong>Cách dùng:</strong> Nhân sự phụ trách export CSV → upload vào đây → dashboard tự cập nhật cho toàn team
 </div>
 
 <div class="upload-section">
@@ -130,8 +130,9 @@ tbody tr:last-child td{border-bottom:none}
     </div>
     <input type="file" id="csv-input" accept=".csv" onchange="handleFile(this.files[0])">
     <button class="btn btn-primary" onclick="document.getElementById('csv-input').click()">Chọn file CSV</button>
+    <button class="btn" id="btn-token" onclick="promptToken()" title="Cấu hình quyền upload">🔑</button>
     <button class="btn btn-danger" id="btn-clear" onclick="clearUploaded()" style="display:none">✕ Xóa data mới</button>
-    <span class="status" id="upload-status">Chờ upload</span>
+    <span class="status" id="upload-status">Chờ tải...</span>
   </div>
 </div>
 
@@ -280,13 +281,86 @@ function updatePills(){
   document.getElementById('total-badge').className='badge '+(newRows.length?'badge-orange':'badge-blue');
 }
 
+/* ── GITHUB API ── */
+const GH = {
+  owner: 'hoangduy8192',
+  repo:  'pandemos-dashboard',
+  path:  'data/latest.csv',
+  get token(){ return localStorage.getItem('gh_token')||''; }
+};
+const RAW_URL = `https://raw.githubusercontent.com/${GH.owner}/${GH.repo}/main/${GH.path}`;
+const API_URL = `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${GH.path}`;
+
+async function fetchFromGitHub(){
+  setSt('loading','⏳ Đang tải data...');
+  try{
+    const res = await fetch(RAW_URL+'?t='+Date.now());
+    if(!res.ok) throw new Error('Chưa có data trên GitHub ('+res.status+')');
+    const text = await res.text();
+    if(!text||text.trim().length<10) throw new Error('File rỗng');
+    Papa.parse(text,{header:true,skipEmptyLines:true,dynamicTyping:false,
+      complete:r=>parseCSV(r,'latest.csv'),
+      error:e=>setSt('err','❌ '+e.message)
+    });
+  }catch(e){
+    setSt('err','❌ '+e.message);
+  }
+}
+
+async function uploadToGitHub(csvText, fname){
+  setSt('loading','⏳ Đang lưu lên GitHub...');
+  // Lấy SHA file cũ (nếu có) để overwrite
+  let sha = null;
+  try{
+    const r = await fetch(API_URL, {headers:{'Authorization':'token '+GH.token}});
+    if(r.ok){ const j=await r.json(); sha=j.sha; }
+  }catch(e){}
+  const body = {
+    message: `Update data: ${fname} (${new Date().toLocaleString('vi-VN')})`,
+    content: btoa(unescape(encodeURIComponent(csvText))),
+    ...(sha?{sha}:{})
+  };
+  const res = await fetch(API_URL,{
+    method:'PUT',
+    headers:{'Authorization':'token '+GH.token,'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  if(!res.ok){
+    const err=await res.json();
+    throw new Error(err.message||'GitHub API lỗi');
+  }
+}
+
 /* ── CSV UPLOAD ── */
-function onDrag(e,on){e.preventDefault();document.getElementById('drop-zone').classList.toggle('drag',on);}
+function promptToken(){
+  const cur = localStorage.getItem('gh_token')||'';
+  const t = prompt('Nhập GitHub Token (chỉ người phụ trách upload mới cần):\n(để trống và OK để xóa token)', cur);
+  if(t===null) return;
+  if(t.trim()) { localStorage.setItem('gh_token', t.trim()); toast('✅ Đã lưu token','ok'); }
+  else { localStorage.removeItem('gh_token'); toast('Đã xóa token','info'); }
+}
 function onDrop(e){e.preventDefault();onDrag(e,false);const f=e.dataTransfer.files[0];if(f&&f.name.endsWith('.csv'))handleFile(f);else toast('Chỉ nhận file .csv','err');}
 function handleFile(file){
   if(!file)return;
+  if(!GH.token){ toast('⚠️ Chưa có token — nhấn 🔑 để nhập','err'); setSt('err','⚠️ Cần nhập token trước'); return; }
   setSt('loading','⏳ Đang đọc...');
-  Papa.parse(file,{header:true,skipEmptyLines:true,dynamicTyping:false,complete:r=>parseCSV(r,file.name),error:e=>setSt('err','❌ '+e.message)});
+  const reader=new FileReader();
+  reader.onload=async(ev)=>{
+    const csvText=ev.target.result;
+    try{
+      await uploadToGitHub(csvText, file.name);
+      toast('✅ Đã lưu lên GitHub!','ok');
+      // Parse và hiển thị luôn
+      Papa.parse(csvText,{header:true,skipEmptyLines:true,dynamicTyping:false,
+        complete:r=>parseCSV(r,file.name),
+        error:e=>setSt('err','❌ '+e.message)
+      });
+    }catch(e){
+      setSt('err','❌ '+e.message);
+      toast('❌ '+e.message,'err');
+    }
+  };
+  reader.readAsText(file,'UTF-8');
 }
 function parseCSV(res,fname){
   const rows=res.data;
@@ -348,15 +422,15 @@ function clearUploaded(){
 }
 function restoreLS(){
   try{
-    const raw=localStorage.getItem(LS);if(!raw)return;
-    const {rows,fname,ts}=JSON.parse(raw);if(!rows||!rows.length)return;
+    const raw=localStorage.getItem(LS);if(!raw)return false;
+    const {rows,fname,ts}=JSON.parse(raw);if(!rows||!rows.length)return false;
     newRows=rows.map(r=>({...r,src:'new'}));
     const age=Math.round((Date.now()-ts)/60000);
     setSt('ok',`✅ ${rows.length} ngày từ ${fname} (${age} phút trước)`);
     document.getElementById('last-update').textContent=`Upload: ${fname} · ${age} phút trước`;
     document.getElementById('btn-clear').style.display='';
-    toast(`✅ Khôi phục data: ${rows.length} ngày (${age} phút trước)`,'info');
-  }catch(e){}
+    return true;
+  }catch(e){return false;}
 }
 function setSt(type,msg){const e=document.getElementById('upload-status');e.textContent=msg;e.className='status'+(type?' '+type:'');}
 function toast(msg,type){const t=document.getElementById('toast');t.textContent=msg;t.className='show '+(type||'info');clearTimeout(t._t);t._t=setTimeout(()=>t.className='',3200);}
@@ -445,8 +519,10 @@ function switchTab(tab,el){
 function renderCur(){if(document.getElementById('weekly-panel').classList.contains('on'))renderW();else renderD();}
 
 /* ── INIT ── */
-restoreLS();
+const hasCached = restoreLS();
 merge();
+// Luôn fetch data mới nhất từ GitHub khi load
+fetchFromGitHub();
 </script>
 </body>
 </html>
